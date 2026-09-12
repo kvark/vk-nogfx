@@ -54,6 +54,11 @@ static struct {
     VkPhysicalDevice handle;
     struct family_map map;
 } phys[MAX_OBJECTS];
+static struct family_map g_map;
+static PFN_vkGetDeviceQueue g_GetDeviceQueue;
+static PFN_vkGetDeviceQueue2 g_GetDeviceQueue2;
+static PFN_vkCreateCommandPool g_CreateCommandPool;
+static PFN_vkGetDeviceProcAddr g_gdpa;
 
 static int debug_enabled(void) {
     const char *e = getenv("VK_LAYER_NOGFX_DEBUG");
@@ -171,22 +176,24 @@ static void apply_app_order(const struct family_map *map, uint32_t count,
         props[i] = real[map->to_real[i]];
 }
 
-static VkLayerInstanceCreateInfo *find_instance_link(const VkInstanceCreateInfo *info) {
+static VkLayerInstanceCreateInfo *find_instance_chain(const VkInstanceCreateInfo *info,
+                                                      VkLayerFunction function) {
     const VkLayerInstanceCreateInfo *chain = (const void *)info->pNext;
     while (chain) {
         if (chain->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO &&
-            chain->function == VK_LAYER_LINK_INFO)
+            chain->function == function)
             return (VkLayerInstanceCreateInfo *)chain;
         chain = (const void *)chain->pNext;
     }
     return NULL;
 }
 
-static VkLayerDeviceCreateInfo *find_device_link(const VkDeviceCreateInfo *info) {
+static VkLayerDeviceCreateInfo *find_device_chain(const VkDeviceCreateInfo *info,
+                                                  VkLayerFunction function) {
     const VkLayerDeviceCreateInfo *chain = (const void *)info->pNext;
     while (chain) {
         if (chain->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO &&
-            chain->function == VK_LAYER_LINK_INFO)
+            chain->function == function)
             return (VkLayerDeviceCreateInfo *)chain;
         chain = (const void *)chain->pNext;
     }
@@ -205,13 +212,19 @@ static struct instance_data *instance_from_phys(VkPhysicalDevice phd) {
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator,
                      VkInstance *pInstance) {
-    VkLayerInstanceCreateInfo *link = find_instance_link(pCreateInfo);
+    VkLayerInstanceCreateInfo *link = find_instance_chain(pCreateInfo, VK_LAYER_LINK_INFO);
+    VkLayerInstanceCreateInfo *loader_data =
+        find_instance_chain(pCreateInfo, VK_LOADER_DATA_CALLBACK);
     if (!link)
         return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkGetInstanceProcAddr next_gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_vkSetInstanceLoaderData set_loader_data =
+        loader_data ? loader_data->u.pfnSetInstanceLoaderData : NULL;
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
     VkResult r = create(pCreateInfo, pAllocator, pInstance);
+    if (r == VK_SUCCESS && set_loader_data)
+        set_loader_data(*pInstance, *pInstance);
     if (r != VK_SUCCESS)
         return r;
     pthread_mutex_lock(&lock);
@@ -339,8 +352,11 @@ layer_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pC
     struct family_map *stored = phys_map(physicalDevice, 0);
     if (stored)
         map = *stored;
-    VkLayerDeviceCreateInfo *link = find_device_link(pCreateInfo);
+    VkLayerDeviceCreateInfo *link = find_device_chain(pCreateInfo, VK_LAYER_LINK_INFO);
+    VkLayerDeviceCreateInfo *loader_data = find_device_chain(pCreateInfo, VK_LOADER_DATA_CALLBACK);
     PFN_vkGetDeviceProcAddr next_gdpa = NULL;
+    PFN_vkSetDeviceLoaderData set_loader_data =
+        loader_data ? loader_data->u.pfnSetDeviceLoaderData : NULL;
     if (link) {
         next_gdpa = link->u.pLayerInfo->pfnNextGetDeviceProcAddr;
         link->u.pLayerInfo = link->u.pLayerInfo->pNext;
@@ -352,8 +368,13 @@ layer_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pC
         if (n > MAX_FAMILIES)
             n = MAX_FAMILIES;
         memcpy(queues, pCreateInfo->pQueueCreateInfos, n * sizeof(queues[0]));
-        for (uint32_t i = 0; i < n; i++)
-            queues[i].queueFamilyIndex = to_real(&map, queues[i].queueFamilyIndex);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t app = queues[i].queueFamilyIndex;
+            queues[i].queueFamilyIndex = to_real(&map, app);
+            if (debug_enabled())
+                fprintf(stderr, "[%s] CreateDevice queueFamilyIndex %u -> %u\n", LAYER_NAME, app,
+                        queues[i].queueFamilyIndex);
+        }
         ci.pQueueCreateInfos = queues;
         ci.queueCreateInfoCount = n;
     }
@@ -363,21 +384,33 @@ layer_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pC
     VkResult r = create(physicalDevice, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS)
         return r;
+    if (!next_gdpa && inst->GetDeviceProcAddr)
+        next_gdpa = inst->GetDeviceProcAddr;
+    PFN_vkGetDeviceQueue next_get_queue =
+        next_gdpa ? (PFN_vkGetDeviceQueue)next_gdpa(*pDevice, "vkGetDeviceQueue") : NULL;
+    PFN_vkGetDeviceQueue2 next_get_queue2 =
+        next_gdpa ? (PFN_vkGetDeviceQueue2)next_gdpa(*pDevice, "vkGetDeviceQueue2") : NULL;
+    PFN_vkCreateCommandPool next_create_pool =
+        next_gdpa ? (PFN_vkCreateCommandPool)next_gdpa(*pDevice, "vkCreateCommandPool") : NULL;
+    PFN_vkDestroyDevice next_destroy =
+        next_gdpa ? (PFN_vkDestroyDevice)next_gdpa(*pDevice, "vkDestroyDevice") : NULL;
+    if (set_loader_data)
+        set_loader_data(*pDevice, *pDevice);
 
     pthread_mutex_lock(&lock);
     struct device_data *dev = device_slot(*pDevice, 1);
     if (dev) {
         dev->map = map;
-        if (!next_gdpa && inst->GetDeviceProcAddr)
-            next_gdpa = inst->GetDeviceProcAddr;
         dev->gdpa = next_gdpa;
-        if (next_gdpa) {
-            dev->GetDeviceQueue = (PFN_vkGetDeviceQueue)next_gdpa(*pDevice, "vkGetDeviceQueue");
-            dev->GetDeviceQueue2 = (PFN_vkGetDeviceQueue2)next_gdpa(*pDevice, "vkGetDeviceQueue2");
-            dev->CreateCommandPool =
-                (PFN_vkCreateCommandPool)next_gdpa(*pDevice, "vkCreateCommandPool");
-            dev->DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(*pDevice, "vkDestroyDevice");
-        }
+        dev->GetDeviceQueue = next_get_queue;
+        dev->GetDeviceQueue2 = next_get_queue2;
+        dev->CreateCommandPool = next_create_pool;
+        dev->DestroyDevice = next_destroy;
+        g_map = map;
+        g_gdpa = next_gdpa;
+        g_GetDeviceQueue = next_get_queue;
+        g_GetDeviceQueue2 = next_get_queue2;
+        g_CreateCommandPool = next_create_pool;
     }
     pthread_mutex_unlock(&lock);
     return r;
@@ -387,8 +420,12 @@ static VKAPI_ATTR void VKAPI_CALL
 layer_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue) {
     pthread_mutex_lock(&lock);
     struct device_data *dev = device_slot(device, 0);
-    uint32_t real = to_real(dev ? &dev->map : NULL, queueFamilyIndex);
-    PFN_vkGetDeviceQueue fn = dev ? dev->GetDeviceQueue : NULL;
+    const struct family_map *map = dev ? &dev->map : &g_map;
+    uint32_t real = to_real(map, queueFamilyIndex);
+    PFN_vkGetDeviceQueue fn = dev && dev->GetDeviceQueue ? dev->GetDeviceQueue : g_GetDeviceQueue;
+    if (debug_enabled())
+        fprintf(stderr, "[%s] GetDeviceQueue %u -> %u (slot=%d fn=%p)\n", LAYER_NAME,
+                queueFamilyIndex, real, dev != NULL, (void *)fn);
     pthread_mutex_unlock(&lock);
     if (fn)
         fn(device, real, queueIndex, pQueue);
@@ -399,8 +436,9 @@ layer_GetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *pQueueInfo, VkQ
     pthread_mutex_lock(&lock);
     struct device_data *dev = device_slot(device, 0);
     VkDeviceQueueInfo2 info = *pQueueInfo;
-    info.queueFamilyIndex = to_real(dev ? &dev->map : NULL, pQueueInfo->queueFamilyIndex);
-    PFN_vkGetDeviceQueue2 fn = dev ? dev->GetDeviceQueue2 : NULL;
+    info.queueFamilyIndex =
+        to_real(dev ? &dev->map : &g_map, pQueueInfo->queueFamilyIndex);
+    PFN_vkGetDeviceQueue2 fn = dev && dev->GetDeviceQueue2 ? dev->GetDeviceQueue2 : g_GetDeviceQueue2;
     pthread_mutex_unlock(&lock);
     if (fn)
         fn(device, &info, pQueue);
@@ -412,8 +450,12 @@ layer_CreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *pCreateI
     pthread_mutex_lock(&lock);
     struct device_data *dev = device_slot(device, 0);
     VkCommandPoolCreateInfo info = *pCreateInfo;
-    info.queueFamilyIndex = to_real(dev ? &dev->map : NULL, pCreateInfo->queueFamilyIndex);
-    PFN_vkCreateCommandPool fn = dev ? dev->CreateCommandPool : NULL;
+    uint32_t app = pCreateInfo->queueFamilyIndex;
+    info.queueFamilyIndex = to_real(dev ? &dev->map : &g_map, app);
+    PFN_vkCreateCommandPool fn =
+        dev && dev->CreateCommandPool ? dev->CreateCommandPool : g_CreateCommandPool;
+    if (debug_enabled())
+        fprintf(stderr, "[%s] CreateCommandPool %u -> %u\n", LAYER_NAME, app, info.queueFamilyIndex);
     pthread_mutex_unlock(&lock);
     if (!fn)
         return VK_ERROR_INITIALIZATION_FAILED;
