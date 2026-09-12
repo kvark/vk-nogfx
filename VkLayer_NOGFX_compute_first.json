@@ -1,0 +1,19 @@
+{
+  "file_format_version": "1.2.1",
+  "layer": {
+    "name": "VK_LAYER_NOGFX_compute_first",
+    "type": "GLOBAL",
+    "library_path": "/x/vk-nogfx/libVkLayer_NOGFX_compute_first.so",
+    "api_version": "1.3.204",
+    "implementation_version": "1",
+    "description": "Present a compute-only queue as family 0 and remap submits",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
+      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
+    },
+    "disable_environment": {
+      "DISABLE_VK_LAYER_NOGFX_compute_first": "1"
+    }
+  }
+}
